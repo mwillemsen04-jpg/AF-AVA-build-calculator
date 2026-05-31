@@ -8,7 +8,7 @@
 <!-- Firebase -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getDatabase, ref, set, onValue, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+  import { getDatabase, ref, set, onValue, serverTimestamp, onDisconnect, push, remove } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyB5bYZIAO6IiTnvGYSVxRFxPSvjaPR0_1M",
@@ -29,6 +29,9 @@
   window._firebaseSet = set;
   window._firebaseOnValue = onValue;
   window._firebaseServerTimestamp = serverTimestamp;
+  window._firebaseOnDisconnect = onDisconnect;
+  window._firebasePush = push;
+  window._firebaseRemove = remove;
   window._firebaseReady = true;
   window.dispatchEvent(new Event('firebaseReady'));
 </script>
@@ -2449,12 +2452,109 @@ function App(){
   const[syncStatus,setSyncStatus]=useState('connecting');
   const[lastSaved,setLastSaved]=useState(null);
   const isUpdatingFromDb=React.useRef(false);
+  const[presentUsers,setPresentUsers]=useState([]);
+  const myPresenceRef=React.useRef(null);
+  const mySessionId=React.useRef('u_'+Math.random().toString(36).slice(2,8));
+
+  // Presence: register this user and track others in the same build
+  React.useEffect(()=>{
+    if(!currentSaveName)return;
+    const init=()=>{
+      if(!window._firebaseDb)return;
+      const db=window._firebaseDb;
+      const buildKey=currentSaveName.trim().replace(/[^a-zA-Z0-9_-]/g,'_');
+      const presenceBase=window._firebaseRef(db,'calculator/presence/'+buildKey);
+      const myRef=window._firebaseRef(db,'calculator/presence/'+buildKey+'/'+mySessionId.current);
+      myPresenceRef.current=myRef;
+      const initialData={sessionId:mySessionId.current,joinedAt:Date.now(),viewing:null,lastSeen:Date.now()};
+      window._firebaseSet(myRef,initialData);
+      window._firebaseOnDisconnect(myRef).remove();
+      window._firebaseOnValue(presenceBase,(snap)=>{
+        const data=snap.val();
+        if(!data){setPresentUsers([]);return;}
+        const users=Object.values(data).filter(u=>u.sessionId!==mySessionId.current&&(Date.now()-u.lastSeen)<30000);
+        setPresentUsers(users);
+      });
+    };
+    if(window._firebaseReady)init();
+    else window.addEventListener('firebaseReady',init);
+    return()=>{
+      if(myPresenceRef.current)window._firebaseRemove(myPresenceRef.current);
+      window.removeEventListener('firebaseReady',init);
+    };
+  },[currentSaveName]);
+
+  // Heartbeat to keep presence alive
+  React.useEffect(()=>{
+    const interval=setInterval(()=>{
+      if(!myPresenceRef.current||!window._firebaseDb)return;
+      // Update only lastSeen using a transaction-like approach
+      const db=window._firebaseDb;
+      window._firebaseOnValue(myPresenceRef.current,(snap)=>{
+        const cur=snap.val();
+        if(cur)window._firebaseSet(myPresenceRef.current,{...cur,lastSeen:Date.now()});
+      },{onlyOnce:true});
+    },10000);
+    return()=>clearInterval(interval);
+  },[]);
+
+  // Update detailed presence: country, tab, last action
+  const updateMyPresence=(info)=>{
+    if(!myPresenceRef.current)return;
+    window._firebaseSet(myPresenceRef.current,{
+      sessionId:mySessionId.current,
+      joinedAt:Date.now(),
+      viewing:info.country||null,
+      tab:info.tab||null,
+      lastAction:info.lastAction||null,
+      lastSeen:Date.now()
+    });
+  };
+  // Keep backward compat
+  const updateMyViewing=(name)=>updateMyPresence({country:name});
+
+  // Live sync: listen to live-changes from others for this build
+  React.useEffect(()=>{
+    if(!currentSaveName)return;
+    const init=()=>{
+      if(!window._firebaseDb)return;
+      const db=window._firebaseDb;
+      const buildKey=currentSaveName.trim().replace(/[^a-zA-Z0-9_-]/g,'_');
+      const liveRef=window._firebaseRef(db,'calculator/live/'+buildKey);
+      const unsub=window._firebaseOnValue(liveRef,(snap)=>{
+        const data=snap.val();
+        if(!data||data.by===mySessionId.current)return;
+        // Only apply if the update is newer than our last save
+        if(data.countries){
+          try{
+            const loaded=JSON.parse(data.countries);
+            if(Array.isArray(loaded)){
+              isUpdatingFromDb.current=true;
+              setCountries(loaded);
+              setTimeout(()=>{isUpdatingFromDb.current=false;},100);
+            }
+          }catch(e){}
+        }
+      });
+      return unsub;
+    };
+    let unsub;
+    if(window._firebaseReady)unsub=init();
+    else window.addEventListener('firebaseReady',()=>{unsub=init();});
+    return()=>{if(typeof unsub==='function')unsub();};
+  },[currentSaveName]);
 
   // Auto-save current build when countries change
   const saveTimeout=React.useRef(null);
   React.useEffect(()=>{
     if(!window._firebaseDb||!currentSaveName||syncStatus==='connecting')return;
+    if(isUpdatingFromDb.current)return; // don't re-broadcast changes we received
     setSyncStatus('saving');
+    // Broadcast live to others immediately (no debounce)
+    const db=window._firebaseDb;
+    const buildKey=currentSaveName.trim().replace(/[^a-zA-Z0-9_-]/g,'_');
+    const liveRef=window._firebaseRef(db,'calculator/live/'+buildKey);
+    window._firebaseSet(liveRef,{countries:JSON.stringify(countries),by:mySessionId.current,at:Date.now()});
     if(saveTimeout.current)clearTimeout(saveTimeout.current);
     saveTimeout.current=setTimeout(()=>{
       saveBuild(currentSaveName);
@@ -2463,7 +2563,32 @@ function App(){
   },[countries]);
   // Day 1 = 70%, Day 2 = 76%, Day 3 = 76% + capitals×10% (per country)
   const morale=[70,76,79];
-  const updateCountry=(id,updated)=>setCountries(countries.map(c=>c.id===id?updated:c));
+  const updateCountry=(id,updated,actionHint)=>{
+    // Detect what changed for presence
+    const prev=countries.find(c=>c.id===id);
+    let lastAction=actionHint||null;
+    if(!lastAction&&prev){
+      const prevItems=(prev.items||[]).length+(prev.buildings||[]).length;
+      const newItems=(updated.items||[]).length+(updated.buildings||[]).length;
+      if(newItems>prevItems){
+        // Something was added — find the new item
+        const allNew=[...(updated.items||[]),...(updated.buildings||[])];
+        const allOld=new Set([...(prev.items||[]),...(prev.buildings||[])].map(i=>i.id));
+        const added=allNew.filter(i=>!allOld.has(i.id));
+        if(added.length>0){
+          const a=added[0];
+          const label=a.label||(a.name?`${a.name} Lv${a.lvl||1}`:'item');
+          lastAction=`➕ ${label}${a.qty>1?' ×'+a.qty:''}`;
+        }
+      } else if(newItems<prevItems){
+        lastAction='🗑 item verwijderd';
+      } else if(updated.tab!==prev.tab){
+        lastAction=null; // tab switch, don't show as action
+      }
+    }
+    updateMyPresence({country:updated.name||null,tab:updated.tab||null,lastAction});
+    setCountries(countries.map(c=>c.id===id?updated:c));
+  };
   const removeCountry=(id)=>setCountries(countries.filter(c=>c.id!==id));
   const dayColors={0:"#64748b",1:"#3b82f6",2:"#a855f7",3:"#f97316"};
 
@@ -2604,6 +2729,27 @@ function App(){
             <div style={{width:8,height:8,borderRadius:"50%",background:syncStatus==='synced'?"#22c55e":syncStatus==='saving'?"#f59e0b":syncStatus==='error'?"#ef4444":"#475569"}}/>
             {syncStatus==='synced'?"Synced":syncStatus==='saving'?"Saving...":syncStatus==='error'?"Sync error":"Connecting..."}
           </div>
+          {presentUsers.length>0&&(
+            <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+              <span style={{fontSize:10,color:"#60a5fa",fontWeight:700,letterSpacing:1,textTransform:"uppercase"}}>👥 Live:</span>
+              {presentUsers.map((u,i)=>{
+                const tabIcons={"cities":"🏙","production":"⚔️","upgrades":"⬆️","research":"🔬","buildings":"🏗"};
+                const tabIcon=u.tab?tabIcons[u.tab]||"📋":"";
+                return(
+                  <div key={u.sessionId} style={{background:"#0d1f35",border:"1px solid #1e3a5f",borderRadius:6,padding:"3px 8px",fontSize:11,color:"#93c5fd",display:"flex",flexDirection:"column",gap:1,maxWidth:200}}>
+                    <div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <span style={{width:6,height:6,borderRadius:"50%",background:"#22c55e",display:"inline-block",flexShrink:0}}/>
+                      <span style={{fontWeight:700,color:"#60a5fa",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {u.viewing||`Gebruiker ${i+1}`}
+                      </span>
+                      {u.tab&&<span style={{color:"#64748b",fontSize:10}}>{tabIcon} {u.tab}</span>}
+                    </div>
+                    {u.lastAction&&<div style={{fontSize:10,color:"#94a3b8",paddingLeft:10,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.lastAction}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
         {/* Save as dialog */}
         {showSaveDialog&&(
